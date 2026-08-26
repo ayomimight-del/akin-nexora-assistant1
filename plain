@@ -1,0 +1,142 @@
+
+---
+
+### `src/server.ts`
+```typescript
+import express, { Request, Response } from "express";
+import { loadEnvironment } from "./config/environment";
+import { logger } from "./utils/logger";
+import { TelegramService } from "./services/telegram";
+import { HandoffService } from "./services/handoff";
+import { LeadService } from "./services/leads";
+import { Assistant } from "./ai/assistant";
+import { CommandHandler } from "./bot/commands";
+import { MessageHandler } from "./bot/messages";
+import { BusinessHandler } from "./bot/business";
+import { TelegramUpdate } from "./types";
+
+let envConfig: ReturnType<typeof loadEnvironment>;
+try {
+  envConfig = loadEnvironment();
+} catch (error) {
+  logger.error("Failed to load environment configuration", { error: String(error) });
+  process.exit(1);
+}
+
+const telegramService = new TelegramService(envConfig.botToken);
+const handoffService = new HandoffService();
+const leadService = new LeadService();
+const assistant = new Assistant(envConfig);
+const commandHandler = new CommandHandler(
+  handoffService,
+  leadService,
+  telegramService,
+  envConfig.ownerTelegramId
+);
+const messageHandler = new MessageHandler(
+  assistant,
+  handoffService,
+  leadService,
+  telegramService,
+  commandHandler,
+  envConfig.ownerTelegramId
+);
+const businessHandler = new BusinessHandler(handoffService, telegramService);
+
+const app = express();
+app.use(express.json());
+
+app.get("/health", (_req: Request, res: Response) => {
+  res.status(200).json({ status: "ok" });
+});
+
+app.post("/webhook", async (req: Request, res: Response) => {
+  res.status(200).send("OK");
+
+  try {
+    const update = req.body as TelegramUpdate;
+
+    if (!update || !update.update_id) {
+      logger.warn("Invalid update received", { body: req.body });
+      return;
+    }
+
+    logger.debug("Webhook received", { updateId: update.update_id });
+
+    if (update.business_connection) {
+      await businessHandler.handleBusinessConnectionUpdate(update);
+      return;
+    }
+
+    if (update.deleted_business_messages) {
+      await businessHandler.handleDeletedBusinessMessages(update);
+      return;
+    }
+
+    if (update.business_message) {
+      await businessHandler.handleBusinessMessage(update);
+      await messageHandler.handleUpdate(update);
+      return;
+    }
+
+    if (update.message) {
+      await messageHandler.handleUpdate(update);
+      return;
+    }
+
+    if (update.edited_business_message) {
+      logger.debug("Edited business message received", {
+        chatId: update.edited_business_message.chat.id,
+      });
+      return;
+    }
+  } catch (error) {
+    logger.error("Error processing webhook", { error: String(error) });
+  }
+});
+
+app.use((err: Error, _req: Request, res: Response, _next: express.NextFunction) => {
+  logger.error("Express error", { error: err.message });
+  res.status(500).json({ error: "Internal server error" });
+});
+
+const server = app.listen(envConfig.port, "0.0.0.0", async () => {
+  logger.info(`Server started on port ${envConfig.port}`);
+
+  const me = await telegramService.getMe();
+  if (me.ok && me.result) {
+    logger.info(`Bot authenticated: @${me.result.username}`);
+  } else {
+    logger.error("Failed to authenticate bot. Check your BOT_TOKEN.");
+    process.exit(1);
+  }
+
+  const webhookSet = await telegramService.setWebhook(envConfig.webhookUrl);
+  if (!webhookSet) {
+    logger.error("Failed to set webhook. Check your WEBHOOK_URL.");
+  }
+});
+
+process.on("SIGTERM", () => {
+  logger.info("SIGTERM received, shutting down gracefully");
+  server.close(() => {
+    logger.info("Server closed");
+    process.exit(0);
+  });
+});
+
+process.on("SIGINT", () => {
+  logger.info("SIGINT received, shutting down gracefully");
+  server.close(() => {
+    logger.info("Server closed");
+    process.exit(0);
+  });
+});
+
+process.on("uncaughtException", (error) => {
+  logger.error("Uncaught exception", { error: String(error) });
+});
+
+process.on("unhandledRejection", (reason) => {
+  logger.error("Unhandled rejection", { reason: String(reason) });
+});
